@@ -22,10 +22,9 @@ import (
 )
 
 const (
-	annotationsMultusCniKey = "k8s.v1.cni.cncf.io/networks"
+	annotationsMultusCniKey    = "k8s.v1.cni.cncf.io/networks"
+	annotationsMultusNamespace = "k8s.v1.cni.cncf.io/namespaces"
 )
-
-
 
 type MultusWebhook struct {
 	DynamicClient dynamic.Interface
@@ -158,12 +157,17 @@ func (p *MultusWebhook) injectorMutatePods(ar v1beta1.AdmissionReview) *v1beta1.
 			return reviewResponse
 		}
 	}
-	result,err := p.lookUpOwnerReference(podCopy.OwnerReferences, ar.Request.Namespace)
+
+	result, err := p.lookUpNamespace(podCopy, ar.Request.Namespace)
 	if err != nil {
 		return reviewResponse
 	}
+
 	if result == nil {
-		return reviewResponse
+		result, err = p.lookUpOwnerReference(podCopy.OwnerReferences, ar.Request.Namespace)
+		if err != nil || result == nil {
+			return reviewResponse
+		}
 	}
 
 	cniValue, ok := result[annotationsMultusCniKey].(string)
@@ -204,7 +208,40 @@ func (p *MultusWebhook) injectorMutatePods(ar v1beta1.AdmissionReview) *v1beta1.
 	return reviewResponse
 }
 
-func (p *MultusWebhook) lookUpOwnerReference(ownerReferences []metav1.OwnerReference, namespace string) (map[string]interface{},error) {
+func (p *MultusWebhook) lookUpNamespace(pod *corev1.Pod, namespace string) (annotations map[string]interface{}, err error) {
+	namespaceObj, err := p.DynamicClient.
+		Resource(schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"}).
+		Get(namespace, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	namespaceAnnotations := namespaceObj.GetAnnotations()
+	if namespaceAnnotations == nil {
+		return nil, nil
+	}
+
+	multusAnnotation, ok := namespaceAnnotations[annotationsMultusNamespace]
+	if !ok {
+		return nil, nil
+	}
+
+	annotations = make(map[string]interface{})
+
+	if pod.Annotations != nil {
+		for k, v := range pod.Annotations {
+			annotations[k] = v
+		}
+	}
+
+	annotations[annotationsMultusCniKey] = multusAnnotation
+
+	log.Printf("lookup namespace use namespace multus webhooks: %v\n", annotations)
+
+	return
+}
+
+func (p *MultusWebhook) lookUpOwnerReference(ownerReferences []metav1.OwnerReference, namespace string) (map[string]interface{}, error) {
 
 	if len(ownerReferences) > 0 {
 		for _, or := range ownerReferences {
@@ -218,7 +255,7 @@ func (p *MultusWebhook) lookUpOwnerReference(ownerReferences []metav1.OwnerRefer
 			}
 			unstructuredObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 			if err != nil {
-				return  nil,err
+				return nil, err
 			}
 
 			orMap, ok := unstructuredObj["metadata"].(map[string]interface{})["ownerReferences"].([]interface{})
@@ -250,11 +287,11 @@ func (p *MultusWebhook) lookUpOwnerReference(ownerReferences []metav1.OwnerRefer
 				}
 
 				if len(ors) > 0 {
-					result,err:=p.lookUpOwnerReference(ors, namespace)
-					if err!= nil {
-						return nil,err
+					result, err := p.lookUpOwnerReference(ors, namespace)
+					if err != nil {
+						return nil, err
 					}
-					return result,nil
+					return result, nil
 				}
 			}
 
